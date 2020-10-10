@@ -146,6 +146,7 @@ def _hybridvnet(X1, X2,  image_z, image_width, image_height, image_channel, phas
     inputX2 = tf.reshape(X2, [-1, image_z, image_width, image_height, image_channel])  # shape=(?, 32, 32, 1)
    
     # Hybrid Vnet model
+    #FUSION
     # layer1->convolution
     layer0_1 = conv_bn_relu_drop(x=inputX1, kernal=(3, 3, 3, image_channel, 16), phase=phase, drop=drop,
                                  scope='layer0_1')
@@ -277,7 +278,8 @@ def _hybridvnet(X1, X2,  image_z, image_width, image_height, image_channel, phas
     layer7 = conv_bn_relu_drop(x=layer7, kernal=(3, 3, 3, 64, 64), image_z=Z, height=H, width=W, phase=phase,
                                drop=drop, scope='layer7_3')
     layer7 = resnet_Add(x1=deconv2, x2=layer7)
-    # layer10->deconvolution
+   # ETV
+   # layer10->deconvolution
     deconv3 = deconv_relu(x=layer7, kernal=(3, 3, 3, 32, 64), scope='deconv3')
     # layer11->convolution
     layer8 = crop_and_concat(layer2, deconv3)
@@ -311,13 +313,13 @@ def _hybridvnet(X1, X2,  image_z, image_width, image_height, image_channel, phas
      
       #RESNET++ BLOCK
       
-    # ETV BLOCK
+    # OUTPUT BLOCK
+    
     egm_output = edge_guidance_model(x1=layer1, x2=layer2, scope='edm')
     _, _, _, _, egm_output_C = egm_output.get_shape().as_list()
-    #WGM BLOCK
-   
+    
     wam_output = weighted_aggregation_model(x1=layer6, x2=layer7, x3=layer8, x4=layer9_3, Channel=128, scope='wam')
-    # # OUTPUT
+ 
     
     fusion_output = crop_and_concat(x1=egm_output, x2=wam_output)
     output_map = conv_active(x=fusion_output, kernal=(1, 1, 1, 16 + egm_output_C, n_class),active='sigmod', scope='output')
