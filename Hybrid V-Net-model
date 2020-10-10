@@ -1,0 +1,314 @@
+from hybridson.layer import (conv3d, deconv3d, normalizationlayer, crop_and_concat, resnet_Add,upsample3d,
+                        weight_xavier_init, bias_variable, save_images)
+import tensorflow as tf
+import numpy as np
+import cv2
+import os
+
+
+def connected_relu(x, kernal, activefunction='relu', scope=None):
+    with tf.name_scope(scope):
+        W = weight_xavier_init(shape=kernal, n_inputs=kernal[0] * kernal[1],
+                               n_outputs=kernal[-1], activefunction='relu', variable_name=scope + 'W')
+        B = bias_variable([kernal[-1]], variable_name=scope + 'B')
+        FC = tf.matmul(x, W) + B
+        if activefunction == 'relu':
+            FC = tf.nn.relu(FC)
+        elif activefunction == 'softmax':
+            FC = tf.nn.softmax(FC)
+        elif activefunction == 'sigmoid':
+            FC = tf.nn.sigmoid(FC)
+        return FC
+def convactive(x, kernal, active=None, scope=None):
+    with tf.name_scope(scope):
+        W = weight_xavier_init(shape=kernal, n_inputs=kernal[0] * kernal[1] * kernal[2] * kernal[3],
+                               n_outputs=kernal[-1], activefunction='relu', variable_name=scope + 'W')
+        B = bias_variable([kernal[-1]], variable_name=scope + 'B')
+        conv = conv3d(x, W) + B
+        if active == 'relu':
+            conv = tf.nn.softmax(conv)
+        if active == 'sigmod':
+            conv = tf.nn.sigmoid(conv)
+        return conv
+
+
+def Spatial_squeeze_Channel_excitation_layer(x, out_dim, ratio=4, scope=None):
+    with tf.name_scope(scope):
+        
+        squeeze = tf.reduce_mean(x, axis=(1, 2, 3), name=scope + 'channel_squeeze')
+       
+        excitation = full_connected_relu(squeeze, kernal=(out_dim, out_dim // ratio), activefunction='relu',
+                                         scope=scope + '_fully_connected1')
+        excitation = full_connected_relu(excitation, kernal=(out_dim // ratio, out_dim),
+                                         activefunction='sigmoid', scope=scope + '_fully_connected2')
+       
+        excitation = tf.reshape(excitation, [-1, 1, 1, 1, out_dim])
+        scale = x * excitation
+        return scale
+
+
+def weighted_aggregation_model(x1, x2,  Channel, scope=None):
+    
+    with tf.name_scope(scope):
+        wb1 = Spatial_squeeze_Channel_excitation_layer(x1, Channel, scope=scope + 'wb1')
+        wb1 = conv_active(wb1, kernal=(1, 1, 1, Channel, Channel // 2), active='relu', scope=scope + 'layer1')
+        wb1 = upsample3d(wb1, 2, scope=scope + 'up1')
+        wb2 = Spatial_squeeze_Channel_excitation_layer(x2, Channel // 2, scope=scope + 'wb2')
+        wb2 = resnet_Add(wb1, wb2)
+        wb2 = conv_active(wb2, kernal=(1, 1, 1, Channel // 2, Channel // 4), active='relu', scope=scope + 'layer2')
+        wb2 = upsample3d(wb2, 2, scope=scope + 'up2')
+       
+        return wb2
+
+
+def edge_guidance_model(x1, x2, scope=None):
+   
+    with tf.name_scope(scope):
+        C1 = x1.get_shape().as_list()[4]
+        layer1 = conv_active(x1, kernal=(1, 1, 1, C1, C1), active='relu', scope=scope + 'layer1_0')
+        layer1 = conv_active(layer1, kernal=(3, 3, 3, C1, C1), active='relu', scope=scope + 'layer1_1')
+
+        C2 = x2.get_shape().as_list()[4]
+        layer2 = upsample3d(x2, scale_factor=2, scope=scope + 'up1')
+        layer2 = conv_active(layer2, kernal=(1, 1, 1, C2, C2), active='relu', scope=scope + 'layer2_0')
+        layer2 = conv_active(layer2, kernal=(3, 3, 3, C2, C2), active='relu', scope=scope + 'layer2_1')
+
+        egm = crop_and_concat(layer1, layer2)
+
+        C = C1 + C2
+        egm = conv_active(egm, kernal=(1, 1, 1, C, C), scope=scope + 'layer3')
+        return egm
+
+
+
+def conv_bn_relu_drop(x, kernal, phase, drop, image_z=None, height=None, width=None, scope=None):
+   
+    with tf.name_scope(scope):
+        W = weight_xavier_init(shape=kernal, n_inputs=kernal[0] * kernal[1] * kernal[2] * kernal[3],
+                               n_outputs=kernal[-1], activefunction='relu', variable_name=scope + 'conv_W')
+        B = bias_variable([kernal[-1]], variable_name=scope + 'conv_B')
+        conv = conv3d(x, W) + B
+        conv = normalizationlayer(conv, is_train=phase, height=height, width=width, image_z=image_z, norm_type='group',
+                                  scope=scope)
+        conv = tf.nn.dropout(tf.nn.relu(conv), drop)
+        return conv
+
+
+def down_sampling(x, kernal, phase, drop, image_z=None, height=None, width=None, scope=None):
+    with tf.name_scope(scope):
+        W = weight_xavier_init(shape=kernal, n_inputs=kernal[0] * kernal[1] * kernal[2] * kernal[3],
+                               n_outputs=kernal[-1],
+                               activefunction='relu', variable_name=scope + 'W')
+        B = bias_variable([kernal[-1]], variable_name=scope + 'B')
+        conv = conv3d(x, W, 2) + B
+        conv = normalizationlayer(conv, is_train=phase, height=height, width=width, image_z=image_z, norm_type='group',
+                                  scope=scope)
+        conv = tf.nn.dropout(tf.nn.relu(conv), drop)
+        return conv
+
+
+def deconv_relu(x, kernal, samefeture=False, scope=None):
+    with tf.name_scope(scope):
+        W = weight_xavier_init(shape=kernal, n_inputs=kernal[0] * kernal[1] * kernal[2] * kernal[-1],
+                               n_outputs=kernal[-2], activefunction='relu', variable_name=scope + 'W')
+        B = bias_variable([kernal[-2]], variable_name=scope + 'B')
+        conv = deconv3d(x, W, samefeture, True) + B
+        conv = tf.nn.relu(conv)
+        return conv
+
+
+def conv_sigmod(x, kernal, scope=None):
+    with tf.name_scope(scope):
+        W = weight_xavier_init(shape=kernal, n_inputs=kernal[0] * kernal[1] * kernal[2] * kernal[3],
+                               n_outputs=kernal[-1], activefunction='sigomd', variable_name=scope + 'W')
+        B = bias_variable([kernal[-1]], variable_name=scope + 'B')
+        conv = conv3d(x, W) + B
+        conv = tf.nn.sigmoid(conv)
+        return conv
+
+def _hybridvnet(X1, X2,  image_z, image_width, image_height, image_channel, phase, drop, n_class=1):
+   # two fusion input(x1,x2)
+    
+    inputX1 = tf.reshape(X1, [-1, image_z, image_width, image_height, image_channel])  # shape=(?, 32, 32, 1)
+    inputX2 = tf.reshape(X2, [-1, image_z, image_width, image_height, image_channel])  # shape=(?, 32, 32, 1)
+   
+    # Hybrid Vnet model
+    #FUSION
+    # layer1->convolution
+    layer0_1 = conv_bn_relu_drop(x=inputX1, kernal=(3, 3, 3, image_channel, 16), phase=phase, drop=drop,
+                                 scope='layer0_1')
+    layer1_1 = conv_bn_relu_drop(x=layer0_1, kernal=(3, 3, 3, 16, 16), phase=phase, drop=drop,
+                                 scope='layer1_1')
+    layer1_1 = resnet_Add(x1=layer0_1, x2=layer1_1)
+    layer0_2 = conv_bn_relu_drop(x=inputX2, kernal=(3, 3, 3, image_channel, 16), phase=phase, drop=drop,
+                                 scope='layer0_2')
+    layer1_2 = conv_bn_relu_drop(x=layer0_2, kernal=(3, 3, 3, 16, 16), phase=phase, drop=drop,
+                                 scope='layer1_2')
+    layer1_2 = resnet_Add(x1=layer0_2, x2=layer1_2)
+    
+
+    layer1 = crop_and_concat(layer1_1, layer1_2)
+    layer1 = conv_bn_relu_drop(x=layer1, kernal=(3, 3, 3, 16 * 2, 16), phase=phase, drop=drop,
+                               scope='layer1')
+    # down sampling1
+    down1_1 = down_sampling(x=layer1_1, kernal=(3, 3, 3, 16, 32), phase=phase, drop=drop, scope='down1_1')
+    down1_2 = down_sampling(x=layer1_2, kernal=(3, 3, 3, 16, 32), phase=phase, drop=drop, scope='down1_2')
+    
+    # layer2->convolution
+    layer2_1 = conv_bn_relu_drop(x=down1_1, kernal=(3, 3, 3, 32, 32), phase=phase, drop=drop,
+                                 scope='layer2_1')
+    layer2_1 = conv_bn_relu_drop(x=layer2_1, kernal=(3, 3, 3, 32, 32), phase=phase, drop=drop,
+                                 scope='layer2_2')
+    layer2_1 = resnet_Add(x1=down1_1, x2=layer2_1)
+    layer2_2 = conv_bn_relu_drop(x=down1_2, kernal=(3, 3, 3, 32, 32), phase=phase, drop=drop,
+                                 scope='layer2_3')
+    layer2_2 = conv_bn_relu_drop(x=layer2_2, kernal=(3, 3, 3, 32, 32), phase=phase, drop=drop,
+                                 scope='layer2_4')
+    layer2_2 = resnet_Add(x1=down1_2, x2=layer2_2)
+    
+
+    layer2 = crop_and_concat(layer2_1, layer2_2)
+    layer2 = conv_bn_relu_drop(x=layer2, kernal=(3, 3, 3, 32 * 2, 32), phase=phase, drop=drop,
+                               scope='layer2')
+    # down sampling2
+    down2_1 = down_sampling(x=layer2_1, kernal=(3, 3, 3, 32, 64), phase=phase, drop=drop, scope='down2_1')
+    down2_2 = down_sampling(x=layer2_2, kernal=(3, 3, 3, 32, 64), phase=phase, drop=drop, scope='down2_2')
+   
+    # layer3->convolution
+    layer3_1 = conv_bn_relu_drop(x=down2_1, kernal=(3, 3, 3, 64, 64), phase=phase, drop=drop,
+                                 scope='layer3_1')
+    layer3_1 = conv_bn_relu_drop(x=layer3_1, kernal=(3, 3, 3, 64, 64), phase=phase, drop=drop,
+                                 scope='layer3_2')
+    layer3_1 = conv_bn_relu_drop(x=layer3_1, kernal=(3, 3, 3, 64, 64), phase=phase, drop=drop,
+                                 scope='layer3_2_1')
+    layer3_1 = resnet_Add(x1=down2_1, x2=layer3_1)
+    layer3_2 = conv_bn_relu_drop(x=down2_2, kernal=(3, 3, 3, 64, 64), phase=phase, drop=drop,
+                                 scope='layer3_3')
+    layer3_2 = conv_bn_relu_drop(x=layer3_2, kernal=(3, 3, 3, 64, 64), phase=phase, drop=drop,
+                                 scope='layer3_4')
+    layer3_2 = conv_bn_relu_drop(x=layer3_2, kernal=(3, 3, 3, 64, 64), phase=phase, drop=drop,
+                                 scope='layer3_4_1')
+    layer3_2 = resnet_Add(x1=down2_2, x2=layer3_2)
+   
+
+    layer3 = crop_and_concat(layer3_1, layer3_2)
+    layer3 = conv_bn_relu_drop(x=layer3, kernal=(3, 3, 3, 64 * 2, 64), phase=phase, drop=drop,
+                               scope='layer3')
+    # down sampling3
+    down3_1 = down_sampling(x=layer3_1, kernal=(3, 3, 3, 64, 128), phase=phase, drop=drop, scope='down3_1')
+    down3_2 = down_sampling(x=layer3_2, kernal=(3, 3, 3, 64, 128), phase=phase, drop=drop, scope='down3_2')
+   
+    # layer4->convolution
+    layer4_1 = conv_bn_relu_drop(x=down3_1, kernal=(3, 3, 3, 128, 128), phase=phase, drop=drop,
+                                 scope='layer4_1')
+    layer4_1 = conv_bn_relu_drop(x=layer4_1, kernal=(3, 3, 3, 128, 128), phase=phase, drop=drop,
+                                 scope='layer4_2')
+    layer4_1 = conv_bn_relu_drop(x=layer4_1, kernal=(3, 3, 3, 128, 128), phase=phase, drop=drop,
+                                 scope='layer4_2_1')
+    layer4_1 = resnet_Add(x1=down3_1, x2=layer4_1)
+    layer4_2 = conv_bn_relu_drop(x=down3_2, kernal=(3, 3, 3, 128, 128), phase=phase, drop=drop,
+                                 scope='layer4_3')
+    layer4_2 = conv_bn_relu_drop(x=layer4_2, kernal=(3, 3, 3, 128, 128), phase=phase, drop=drop,
+                                 scope='layer4_4')
+    layer4_2 = conv_bn_relu_drop(x=layer4_2, kernal=(3, 3, 3, 128, 128), phase=phase, drop=drop,
+                                 scope='layer4_4_1')
+    layer4_2 = resnet_Add(x1=down3_2, x2=layer4_2)
+   
+
+    layer4 = crop_and_concat(layer4_1, layer4_2)
+    layer4 = conv_bn_relu_drop(x=layer4, kernal=(3, 3, 3, 128 * 2, 128), phase=phase, drop=drop,
+                               scope='layer4')
+    # down sampling4
+    down4_1 = down_sampling(x=layer4, kernal=(3, 3, 3, 128, 256), phase=phase, drop=drop, scope='down4_1')
+    down4_2 = down_sampling(x=layer4, kernal=(3, 3, 3, 128, 256), phase=phase, drop=drop, scope='down4_2')
+   
+    # layer5->convolution
+    layer5_1 = conv_bn_relu_drop(x=down4_1, kernal=(3, 3, 3, 256, 256), phase=phase, drop=drop,
+                                 scope='layer5_1')
+    layer5_1 = conv_bn_relu_drop(x=layer5_1, kernal=(3, 3, 3, 256, 256), phase=phase, drop=drop,
+                                 scope='layer5_2')
+    layer5_1 = conv_bn_relu_drop(x=layer5_1, kernal=(3, 3, 3, 256, 256), phase=phase, drop=drop,
+                                 scope='layer5_2_1')
+    layer5_1 = resnet_Add(x1=down4_1, x2=layer5_1)
+    layer5_2 = conv_bn_relu_drop(x=down4_2, kernal=(3, 3, 3, 256, 256), phase=phase, drop=drop,
+                                 scope='layer5_3')
+    layer5_2 = conv_bn_relu_drop(x=layer5_2, kernal=(3, 3, 3, 256, 256), phase=phase, drop=drop,
+                                 scope='layer5_4')
+    layer5_2 = conv_bn_relu_drop(x=layer5_2, kernal=(3, 3, 3, 256, 256), phase=phase, drop=drop,
+                                 scope='layer5_4_1')
+    layer5_2 = resnet_Add(x1=down4_2, x2=layer5_2)
+   
+
+    layer5 = crop_and_concat(layer5_1, layer5_2)
+    layer5 = conv_bn_relu_drop(x=layer5, kernal=(3, 3, 3, 256 * 2, 256), phase=phase, drop=drop,
+                               scope='layer5')
+    deconv1 = deconv_relu(x=layer5, kernal=(3, 3, 3, 128, 256), scope='deconv1')
+ # layer7->convolution
+    layer6 = crop_and_concat(layer4, deconv1)
+    _, Z, H, W, _ = layer4.get_shape().as_list()
+    layer6 = conv_bn_relu_drop(x=layer6, kernal=(3, 3, 3, 256, 128), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer6_1')
+    layer6 = conv_bn_relu_drop(x=layer6, kernal=(3, 3, 3, 128, 128), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer6_2')
+    layer6 = conv_bn_relu_drop(x=layer6, kernal=(3, 3, 3, 128, 128), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer6_3')
+    layer6 = resnet_Add(x1=deconv1, x2=layer6)
+    # layer8->deconvolution
+    deconv2 = deconv_relu(x=layer6, kernal=(3, 3, 3, 64, 128), scope='deconv2')
+    # layer9->convolution
+    layer7 = crop_and_concat(layer3, deconv2)
+    _, Z, H, W, _ = layer3.get_shape().as_list()
+    layer7 = conv_bn_relu_drop(x=layer7, kernal=(3, 3, 3, 128, 64), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer7_1')
+    layer7 = conv_bn_relu_drop(x=layer7, kernal=(3, 3, 3, 64, 64), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer7_2')
+    layer7 = conv_bn_relu_drop(x=layer7, kernal=(3, 3, 3, 64, 64), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer7_3')
+    layer7 = resnet_Add(x1=deconv2, x2=layer7)
+   # ETV
+   # layer10->deconvolution
+    deconv3 = deconv_relu(x=layer7, kernal=(3, 3, 3, 32, 64), scope='deconv3')
+    # layer11->convolution
+    layer8 = crop_and_concat(layer2, deconv3)
+    _, Z, H, W, _ = layer2.get_shape().as_list()
+    layer8 = conv_bn_relu_drop(x=layer8, kernal=(3, 3, 3, 64, 32), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer8_1')
+    layer8 = conv_bn_relu_drop(x=layer8, kernal=(3, 3, 3, 32, 32), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer8_2')
+    layer8 = conv_bn_relu_drop(x=layer8, kernal=(3, 3, 3, 32, 32), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer8_3')
+    layer8 = resnet_Add(x1=deconv3, x2=layer8)
+    # layer12->deconvolution
+    deconv4 = deconv_relu(x=layer8, kernal=(3, 3, 3, 16, 32), scope='deconv4')
+    # layer13->convolution
+    layer9_1 = crop_and_concat(layer1, deconv4)
+    _, Z, H, W, _ = layer1.get_shape().as_list()
+    layer9_1 = conv_bn_relu_drop(x=layer9_1, kernal=(3, 3, 3, 32, 16), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer9_1')
+    layer9_2 = conv_bn_relu_drop(x=layer9_1, kernal=(3, 3, 3, 16, 16), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer9_2')
+    # Resnet++ layer
+    layer9_3 = conv_bn_relu_drop(x=layer9_2, kernal=(3, 3, 3, 16, 16), image_z=Z, height=H, width=W, phase=phase,
+                               drop=drop, scope='layer9_3')
+     #RESNET++ BLOCK
+       
+    # f1(x)=f1(x)+x
+    layer9_3 = resnet_Add(x1=deconv4, x2=layer9_1)
+    # f2(x)=f2(x)+x
+    layer9_3 = resnet_Add(x1=layer9_1, x2=layer9_2)
+    #f3(x)= f1(x)+f2(x)
+    layer9_3= resnet_Add(x1=layer9_2, x2=layer9_3)
+     
+      #RESNET++ BLOCK
+      
+    # OUTPUT BLOCK
+    
+    egm_output = edge_guidance_model(x1=layer1, x2=layer2, scope='edm')
+    _, _, _, _, egm_output_C = egm_output.get_shape().as_list()
+    
+    wam_output = weighted_aggregation_model(x1=layer6, x2=layer7, x3=layer8, x4=layer9_3, Channel=128, scope='wam')
+ 
+    
+    fusion_output = crop_and_concat(x1=egm_output, x2=wam_output)
+    output_map = conv_active(x=fusion_output, kernal=(1, 1, 1, 16 + egm_output_C, n_class),active='sigmod', scope='output')
+    return output_map
