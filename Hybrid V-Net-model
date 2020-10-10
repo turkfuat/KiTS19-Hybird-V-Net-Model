@@ -34,30 +34,21 @@ def convactive(x, kernal, active=None, scope=None):
 
 def Spatial_squeeze_Channel_excitation_layer(x, out_dim, ratio=4, scope=None):
     with tf.name_scope(scope):
-        # Global_Average_Pooling,channel_squeeze
+        
         squeeze = tf.reduce_mean(x, axis=(1, 2, 3), name=scope + 'channel_squeeze')
-        # full_connect
+       
         excitation = full_connected_relu(squeeze, kernal=(out_dim, out_dim // ratio), activefunction='relu',
                                          scope=scope + '_fully_connected1')
         excitation = full_connected_relu(excitation, kernal=(out_dim // ratio, out_dim),
                                          activefunction='sigmoid', scope=scope + '_fully_connected2')
-        # scale the x
+       
         excitation = tf.reshape(excitation, [-1, 1, 1, 1, out_dim])
         scale = x * excitation
         return scale
 
 
 def weighted_aggregation_model(x1, x2,  Channel, scope=None):
-    """
-    weighted_aggregation_model
-    :param x1:
-    :param x2:
-    :param x3:
-    :param x4:
-    :param Channel:
-    :param scope:
-    :return:
-    """
+    
     with tf.name_scope(scope):
         wb1 = Spatial_squeeze_Channel_excitation_layer(x1, Channel, scope=scope + 'wb1')
         wb1 = conv_active(wb1, kernal=(1, 1, 1, Channel, Channel // 2), active='relu', scope=scope + 'layer1')
@@ -71,13 +62,7 @@ def weighted_aggregation_model(x1, x2,  Channel, scope=None):
 
 
 def edge_guidance_model(x1, x2, scope=None):
-    """
-    edge_guidance_model
-    :param x1:
-    :param x2:
-    :param scope:
-    :return:
-    """
+   
     with tf.name_scope(scope):
         C1 = x1.get_shape().as_list()[4]
         layer1 = conv_active(x1, kernal=(1, 1, 1, C1, C1), active='relu', scope=scope + 'layer1_0')
@@ -142,6 +127,8 @@ def conv_sigmod(x, kernal, scope=None):
         return conv
 
 def _hybridvnet(X1, X2,  image_z, image_width, image_height, image_channel, phase, drop, n_class=1):
+   # two fusion input(x1,x2)
+    
     inputX1 = tf.reshape(X1, [-1, image_z, image_width, image_height, image_channel])  # shape=(?, 32, 32, 1)
     inputX2 = tf.reshape(X2, [-1, image_z, image_width, image_height, image_channel])  # shape=(?, 32, 32, 1)
    
@@ -300,9 +287,10 @@ def _hybridvnet(X1, X2,  image_z, image_width, image_height, image_channel, phas
                                drop=drop, scope='layer9_1')
     layer9_2 = conv_bn_relu_drop(x=layer9_1, kernal=(3, 3, 3, 16, 16), image_z=Z, height=H, width=W, phase=phase,
                                drop=drop, scope='layer9_2')
+    # Resnet++ layer
     layer9_3 = conv_bn_relu_drop(x=layer9_2, kernal=(3, 3, 3, 16, 16), image_z=Z, height=H, width=W, phase=phase,
                                drop=drop, scope='layer9_3')
-       #RESNET++ BLOCK
+     #RESNET++ BLOCK
        
     # f1(x)=f1(x)+x
     layer9_3 = resnet_Add(x1=deconv4, x2=layer9_1)
